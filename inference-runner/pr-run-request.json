@@ -1,0 +1,6 @@
+{
+  "purpose": "Trigger an auditable pull-request GitHub Actions run for 500 remote-inference sentences.",
+  "requested_at": "2026-08-07",
+  "target_count": 500,
+  "local_model_allowed": false
+}
