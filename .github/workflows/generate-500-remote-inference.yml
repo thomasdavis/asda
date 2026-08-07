@@ -1,0 +1,60 @@
+name: Generate 500 sentences with remote inference
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/generate-500-remote-inference.yml"
+      - "inference-runner/**"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  INFERENCE_MODEL: openai
+  INFERENCE_DELAY_MS: "16000"
+
+jobs:
+  generate:
+    name: Remote model inference
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Record runner identity
+        run: |
+          mkdir -p generated
+          {
+            echo "runner_os=$RUNNER_OS"
+            echo "runner_arch=$RUNNER_ARCH"
+            echo "runner_name=$RUNNER_NAME"
+            echo "repository=$GITHUB_REPOSITORY"
+            echo "workflow=$GITHUB_WORKFLOW"
+            echo "run_id=$GITHUB_RUN_ID"
+            echo "commit=$GITHUB_SHA"
+          } > generated/runner-environment.txt
+
+      - name: Generate 500 sentences through remote inference API
+        run: node inference-runner/generate-500.mjs
+
+      - name: Upload generation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: remote-inference-500-${{ github.run_id }}
+          path: generated/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Commit validated output
+        if: success()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add generated
+          git commit -m "Generate 500 sentences via remote inference" || exit 0
+          git push
