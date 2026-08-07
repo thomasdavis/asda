@@ -3,10 +3,9 @@ import { readFile, writeFile } from 'node:fs/promises';
 const sourceUrl = new URL('./generate-500.mjs', import.meta.url);
 let source = await readFile(sourceUrl, 'utf8');
 
-source = source.replace(
-  /const REQUEST_INTERVAL_MS = .*?;/,
-  'const REQUEST_INTERVAL_MS = 5000;',
-);
+source = source
+  .replace('const BATCH_SIZE = 100;', 'const BATCH_SIZE = 25;')
+  .replace(/const REQUEST_INTERVAL_MS = .*?;/, 'const REQUEST_INTERVAL_MS = 5000;');
 
 source = source.replace(
   /const PROVIDERS = \[[\s\S]*?\n\];\n\nconst sleep/,
@@ -31,7 +30,7 @@ const sleep`,
 source = source
   .replace(
     'async function fetchWithTimeout(url, options, timeoutMs = 300_000)',
-    'async function fetchWithTimeout(url, options, timeoutMs = 90_000)',
+    'async function fetchWithTimeout(url, options, timeoutMs = 75_000)',
   )
   .replace(
     '      temperature: 0.9,\n      seed,\n      max_tokens: 4096,',
