@@ -18,7 +18,7 @@ permissions:
 
 env:
   INFERENCE_MODEL: openai
-  INFERENCE_DELAY_MS: "16000"
+  INFERENCE_DELAY_MS: "5000"
 
 jobs:
   generate:
@@ -45,7 +45,7 @@ jobs:
           } > generated/runner-environment.txt
 
       - name: Generate 500 sentences through remote inference API
-        run: node inference-runner/generate-500.mjs
+        run: node inference-runner/generate-500-fast.mjs
 
       - name: Upload generation evidence
         if: always()
