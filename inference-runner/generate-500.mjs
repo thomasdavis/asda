@@ -3,104 +3,42 @@ import { mkdir, writeFile } from 'node:fs/promises';
 
 const TARGET = 500;
 const BATCH_SIZE = 100;
-const MODEL = process.env.INFERENCE_MODEL || 'openai';
 const MIN_WORDS = 8;
 const MAX_WORDS = 18;
-const INTER_REQUEST_DELAY_MS = Number(process.env.INFERENCE_DELAY_MS || 16000);
+const REQUEST_INTERVAL_MS = Number(process.env.INFERENCE_DELAY_MS || 20000);
 const RUN_ID = `remote-inference-${new Date().toISOString().replace(/[:.]/g, '-')}`;
 
-const topicPalettes = [
-  'weather, forests, oceans, wildlife, seasons, astronomy, and other natural observations',
+const TOPICS = [
+  'weather, forests, oceans, wildlife, seasons, astronomy, and natural observations',
   'computing, engineering, tools, architecture, transport, energy, and practical invention',
-  'food, households, work, markets, education, sport, travel, and ordinary daily routines',
+  'food, households, work, markets, education, sport, travel, and daily routines',
   'history, language, books, music, painting, theatre, archives, and cultural memory',
   'friendship, cooperation, curiosity, uncertainty, planning, imagination, and future societies',
 ];
 
-const transports = [
+const PROVIDERS = [
   {
-    name: 'pollinations-legacy-openai-post',
-    endpoint: 'https://text.pollinations.ai/openai',
-    async call(prompt, seed) {
-      const response = await fetchWithTimeout(this.endpoint, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          model: MODEL,
-          messages: [
-            {
-              role: 'system',
-              content: 'Generate synthetic English-language training data. Obey exact JSON and count constraints.',
-            },
-            { role: 'user', content: prompt },
-          ],
-          seed,
-          temperature: 0.9,
-          max_tokens: 6000,
-          response_format: { type: 'json_object' },
-          private: true,
-        }),
-      });
-      return parseHttpResponse(response, this.name, this.endpoint);
-    },
+    name: 'blockrun-free-gpt-oss-120b',
+    endpoint: 'https://blockrun.ai/api/v1/chat/completions',
+    model: 'nvidia/gpt-oss-120b',
+    kind: 'openai',
   },
   {
-    name: 'pollinations-unified-openai-post',
-    endpoint: 'https://gen.pollinations.ai/v1/chat/completions',
-    async call(prompt, seed) {
-      const response = await fetchWithTimeout(this.endpoint, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          model: MODEL,
-          messages: [
-            {
-              role: 'system',
-              content: 'Generate synthetic English-language training data. Obey exact JSON and count constraints.',
-            },
-            { role: 'user', content: prompt },
-          ],
-          seed,
-          temperature: 0.9,
-          max_tokens: 6000,
-          response_format: { type: 'json_object' },
-        }),
-      });
-      return parseHttpResponse(response, this.name, this.endpoint);
-    },
+    name: 'ovh-anonymous-qwen3-32b',
+    endpoint: 'https://oai.endpoints.kepler.ai.cloud.ovh.net/v1/chat/completions',
+    model: 'Qwen3-32B',
+    kind: 'openai',
   },
   {
-    name: 'pollinations-legacy-text-get',
-    endpoint: 'https://text.pollinations.ai',
-    async call(prompt, seed) {
-      const url = new URL(`${this.endpoint}/${encodeURIComponent(prompt)}`);
-      url.searchParams.set('model', MODEL);
-      url.searchParams.set('seed', String(seed));
-      url.searchParams.set('temperature', '0.9');
-      url.searchParams.set('json', 'true');
-      url.searchParams.set('private', 'true');
-      const response = await fetchWithTimeout(url, { method: 'GET' });
-      return parseHttpResponse(response, this.name, url.toString());
-    },
-  },
-  {
-    name: 'pollinations-unified-text-get',
-    endpoint: 'https://gen.pollinations.ai/text',
-    async call(prompt, seed) {
-      const url = new URL(`${this.endpoint}/${encodeURIComponent(prompt)}`);
-      url.searchParams.set('model', MODEL);
-      url.searchParams.set('seed', String(seed));
-      url.searchParams.set('temperature', '0.9');
-      url.searchParams.set('json', 'true');
-      const response = await fetchWithTimeout(url, { method: 'GET' });
-      return parseHttpResponse(response, this.name, url.toString());
-    },
+    name: 'mlvoca-free-deepseek-r1-1.5b',
+    endpoint: 'https://mlvoca.com/api/generate',
+    model: 'deepseek-r1:1.5b',
+    kind: 'ollama',
   },
 ];
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const sha256 = (value) => createHash('sha256').update(String(value)).digest('hex');
 
 async function fetchWithTimeout(url, options, timeoutMs = 300_000) {
   const controller = new AbortController();
@@ -112,38 +50,99 @@ async function fetchWithTimeout(url, options, timeoutMs = 300_000) {
   }
 }
 
-async function parseHttpResponse(response, transport, endpoint) {
+function buildPrompt({ requested, batchIndex, attempt, accepted }) {
+  const avoid = accepted.slice(-40);
+  return [
+    `Generate exactly ${requested} distinct, natural, standalone English sentences.`,
+    'Return only valid JSON in this exact shape:',
+    '{"sentences":["First complete sentence.","Second complete sentence."]}',
+    `Dataset batch ${batchIndex + 1}; attempt ${attempt}; nonce ${RUN_ID}.`,
+    `Topic palette: ${TOPICS[batchIndex % TOPICS.length]}.`,
+    'Hard constraints:',
+    `- Every sentence contains ${MIN_WORDS} to ${MAX_WORDS} words inclusive.`,
+    '- Every sentence is grammatical, semantically specific, safe, and terminally punctuated.',
+    '- Vary subject, verb, tense, syntax, vocabulary, and length.',
+    '- Do not use numbering, labels, quotations, fragments, slogans, or personal information.',
+    '- Do not repeat or lightly paraphrase another item.',
+    '- Output JSON only, without Markdown, commentary, or reasoning.',
+    avoid.length ? `Never repeat these accepted sentences:\n${avoid.map((s) => `- ${s}`).join('\n')}` : '',
+  ].filter(Boolean).join('\n');
+}
+
+async function invokeProvider(provider, prompt, seed) {
+  let body;
+  if (provider.kind === 'ollama') {
+    body = {
+      model: provider.model,
+      prompt,
+      system: 'Produce synthetic English training data. Follow exact JSON and count constraints.',
+      stream: false,
+      format: 'json',
+      options: { temperature: 0.9, seed, num_predict: 4096 },
+    };
+  } else {
+    body = {
+      model: provider.model,
+      messages: [
+        {
+          role: 'system',
+          content: 'Produce synthetic English training data. Follow exact JSON and count constraints.',
+        },
+        { role: 'user', content: prompt },
+      ],
+      temperature: 0.9,
+      seed,
+      max_tokens: 4096,
+      stream: false,
+    };
+  }
+
+  const startedAt = new Date().toISOString();
+  const response = await fetchWithTimeout(provider.endpoint, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', accept: 'application/json' },
+    body: JSON.stringify(body),
+  });
   const rawBody = await response.text();
   const headers = Object.fromEntries(
     [...response.headers.entries()].filter(([key]) =>
-      ['content-type', 'x-request-id', 'cf-ray', 'retry-after'].includes(key.toLowerCase()),
+      ['content-type', 'x-request-id', 'cf-ray', 'retry-after', 'x-ratelimit-remaining'].includes(key.toLowerCase()),
     ),
   );
+
   if (!response.ok) {
-    const error = new Error(`${transport} returned HTTP ${response.status}: ${rawBody.slice(0, 500)}`);
-    error.httpStatus = response.status;
+    const error = new Error(`${provider.name} returned HTTP ${response.status}: ${rawBody.slice(0, 1000)}`);
+    error.status = response.status;
     error.rawBody = rawBody;
     error.headers = headers;
     throw error;
   }
 
-  let content = rawBody;
+  let parsed;
   try {
-    const parsed = JSON.parse(rawBody);
-    content =
-      parsed?.choices?.[0]?.message?.content ??
-      parsed?.choices?.[0]?.text ??
-      parsed?.response ??
-      parsed?.text ??
-      parsed;
-    if (typeof content !== 'string') content = JSON.stringify(content);
+    parsed = JSON.parse(rawBody);
   } catch {
-    // A simple text endpoint returns the generated text directly.
+    parsed = null;
+  }
+
+  const content = provider.kind === 'ollama'
+    ? parsed?.response
+    : parsed?.choices?.[0]?.message?.content ?? parsed?.choices?.[0]?.text;
+
+  if (typeof content !== 'string' || !content.trim()) {
+    throw new Error(`${provider.name} returned no generated text: ${rawBody.slice(0, 1000)}`);
   }
 
   return {
-    transport,
-    endpoint,
+    provider: provider.name,
+    endpoint: provider.endpoint,
+    requestedModel: provider.model,
+    reportedModel: parsed?.model || provider.model,
+    responseId: parsed?.id || null,
+    usage: parsed?.usage || null,
+    finishReason: parsed?.choices?.[0]?.finish_reason || null,
+    startedAt,
+    completedAt: new Date().toISOString(),
     httpStatus: response.status,
     headers,
     rawBody,
@@ -151,28 +150,32 @@ async function parseHttpResponse(response, transport, endpoint) {
   };
 }
 
-function buildPrompt({ requested, batchIndex, existing }) {
-  const exclusions = existing.slice(-30);
-  return [
-    `Return exactly ${requested} distinct, natural, standalone English sentences in this JSON shape:`,
-    '{"sentences":["First complete sentence.","Second complete sentence."]}',
-    '',
-    `Dataset batch: ${batchIndex + 1}.`,
-    `Topic palette: ${topicPalettes[batchIndex % topicPalettes.length]}.`,
-    'Hard requirements:',
-    `- Every sentence contains ${MIN_WORDS} to ${MAX_WORDS} words inclusive.`,
-    '- Every sentence is grammatical, specific, safe, and ends with terminal punctuation.',
-    '- Vary subjects, verbs, tense, syntax, vocabulary, and sentence length.',
-    '- Do not use numbering, labels, quotations, fragments, slogans, or personal information.',
-    '- Do not repeat or lightly paraphrase another item.',
-    '- Return JSON only, with no Markdown fences or explanatory prose.',
-    `- Fresh-generation nonce: ${RUN_ID}-batch-${batchIndex + 1}.`,
-    exclusions.length
-      ? `Avoid these already accepted sentences:\n${exclusions.map((sentence) => `- ${sentence}`).join('\n')}`
-      : '',
-  ]
-    .filter(Boolean)
-    .join('\n');
+async function callRemoteModel(prompt, seed, preferredProviderIndex) {
+  const indices = PROVIDERS.map((_, index) => index);
+  const order = preferredProviderIndex == null
+    ? indices
+    : [preferredProviderIndex, ...indices.filter((index) => index !== preferredProviderIndex)];
+  const failures = [];
+
+  for (const index of order) {
+    const provider = PROVIDERS[index];
+    try {
+      const response = await invokeProvider(provider, prompt, seed);
+      return { ...response, providerIndex: index, failuresBeforeSuccess: failures };
+    } catch (error) {
+      failures.push({
+        provider: provider.name,
+        endpoint: provider.endpoint,
+        model: provider.model,
+        message: String(error?.message ?? error),
+        httpStatus: error?.status ?? null,
+        headers: error?.headers ?? null,
+        rawBodyPreview: String(error?.rawBody ?? '').slice(0, 1000),
+      });
+    }
+  }
+
+  throw new Error(`Every remote inference provider failed: ${JSON.stringify(failures)}`);
 }
 
 function extractCandidateArray(content) {
@@ -194,11 +197,12 @@ function extractCandidateArray(content) {
       if (Array.isArray(parsed?.sentences)) return parsed.sentences;
       if (Array.isArray(parsed?.data)) return parsed.data;
     } catch {
-      // Continue with the next representation.
+      // Try the next representation.
     }
   }
 
   return text
+    .replace(/<think>[\s\S]*?<\/think>/gi, '')
     .split(/\r?\n/)
     .map((line) => line.replace(/^\s*(?:[-*•]|\d+[.)])\s*/, '').trim())
     .filter(Boolean);
@@ -223,194 +227,166 @@ function wordCount(sentence) {
     .filter(Boolean).length;
 }
 
-function validate(values, alreadySeen) {
+function validate(values, globallySeen, locallySeen) {
   const accepted = [];
   const rejected = [];
-  const localSeen = new Set();
-
   for (const value of values) {
     const sentence = normalizeSentence(value);
     const key = sentence.toLocaleLowerCase('en-US');
     const words = wordCount(sentence);
     let reason = null;
-
     if (!sentence) reason = 'empty';
     else if (words < MIN_WORDS || words > MAX_WORDS) reason = `word_count_${words}`;
-    else if (!/[.!?]$/.test(sentence)) reason = 'missing_terminal_punctuation';
-    else if (alreadySeen.has(key) || localSeen.has(key)) reason = 'duplicate';
+    else if (globallySeen.has(key) || locallySeen.has(key)) reason = 'duplicate';
     else if (sentence.length > 300) reason = 'too_long';
 
     if (reason) rejected.push({ sentence, reason });
     else {
-      localSeen.add(key);
+      locallySeen.add(key);
       accepted.push(sentence);
     }
   }
   return { accepted, rejected };
 }
 
-function summarizeRejections(rejected) {
-  return rejected.reduce((summary, item) => {
+function summarizeRejections(items) {
+  return items.reduce((summary, item) => {
     summary[item.reason] = (summary[item.reason] || 0) + 1;
     return summary;
   }, {});
 }
 
-async function callRemoteModel(prompt, seed, preferredTransportIndex) {
-  const order = preferredTransportIndex == null
-    ? transports.map((_, index) => index)
-    : [preferredTransportIndex, ...transports.map((_, index) => index).filter((index) => index !== preferredTransportIndex)];
-  const failures = [];
-
-  for (const index of order) {
-    const transport = transports[index];
-    try {
-      const response = await transport.call(prompt, seed);
-      return { ...response, transportIndex: index, failuresBeforeSuccess: failures };
-    } catch (error) {
-      failures.push({
-        transport: transport.name,
-        endpoint: transport.endpoint,
-        message: String(error?.message ?? error),
-        httpStatus: error?.httpStatus ?? null,
-        headers: error?.headers ?? null,
-        rawBodyPreview: String(error?.rawBody ?? '').slice(0, 500),
-      });
-    }
-  }
-
-  throw new Error(`Every remote inference transport failed: ${JSON.stringify(failures)}`);
-}
-
 async function main() {
   const startedAt = new Date().toISOString();
-  const acceptedRecords = [];
+  const records = [];
   const calls = [];
   const rawResponses = [];
-  const seen = new Set();
-  let preferredTransportIndex = null;
+  const globalSeen = new Set();
+  let preferredProviderIndex = null;
   let lastRequestAt = 0;
 
-  for (let batchIndex = 0; acceptedRecords.length < TARGET; batchIndex += 1) {
-    const batchTarget = Math.min(BATCH_SIZE, TARGET - acceptedRecords.length);
-    let batchAccepted = 0;
+  for (let batchIndex = 0; records.length < TARGET; batchIndex += 1) {
+    const batchTarget = Math.min(BATCH_SIZE, TARGET - records.length);
+    const batchSentences = [];
+    const batchSeen = new Set();
 
-    for (let attempt = 1; attempt <= 7 && batchAccepted < batchTarget; attempt += 1) {
-      const requested = batchTarget - batchAccepted;
-      const sinceLastRequest = Date.now() - lastRequestAt;
-      if (lastRequestAt && sinceLastRequest < INTER_REQUEST_DELAY_MS) {
-        await sleep(INTER_REQUEST_DELAY_MS - sinceLastRequest);
-      }
+    for (let attempt = 1; attempt <= 8 && batchSentences.length < batchTarget; attempt += 1) {
+      const needed = batchTarget - batchSentences.length;
+      const sinceLast = Date.now() - lastRequestAt;
+      if (lastRequestAt && sinceLast < REQUEST_INTERVAL_MS) await sleep(REQUEST_INTERVAL_MS - sinceLast);
 
       const prompt = buildPrompt({
-        requested,
+        requested: needed,
         batchIndex,
-        existing: acceptedRecords.map((record) => record.sentence),
+        attempt,
+        accepted: [...records.map((record) => record.sentence), ...batchSentences],
       });
-      const seed = 2026080700 + batchIndex * 100 + attempt;
-      const callStartedAt = new Date().toISOString();
+      const seed = 2026080800 + batchIndex * 101 + attempt * 17;
+      const callNumber = calls.length + 1;
       lastRequestAt = Date.now();
 
       let response;
       try {
-        response = await callRemoteModel(prompt, seed, preferredTransportIndex);
-        preferredTransportIndex = response.transportIndex;
+        response = await callRemoteModel(prompt, seed, preferredProviderIndex);
+        preferredProviderIndex = response.providerIndex;
       } catch (error) {
         calls.push({
+          call: callNumber,
           batch: batchIndex + 1,
           attempt,
-          requested,
+          requested: needed,
           seed,
-          startedAt: callStartedAt,
           completedAt: new Date().toISOString(),
           error: String(error?.message ?? error),
         });
-        if (attempt === 7) throw error;
+        if (attempt === 8) throw error;
         await sleep(Math.min(120_000, 10_000 * 2 ** (attempt - 1)));
         continue;
       }
 
-      const parsed = extractCandidateArray(response.content);
-      const validated = validate(parsed, seen);
-      const room = batchTarget - batchAccepted;
-      const taken = validated.accepted.slice(0, room);
-      const callNumber = calls.length + 1;
+      const candidates = extractCandidateArray(response.content);
+      const validated = validate(candidates, globalSeen, batchSeen);
+      const taken = validated.accepted.slice(0, needed);
+      batchSentences.push(...taken);
+      const responseHash = sha256(response.rawBody);
 
-      for (const sentence of taken) {
-        seen.add(sentence.toLocaleLowerCase('en-US'));
-        acceptedRecords.push({
-          id: acceptedRecords.length + 1,
-          sentence,
-          batch: batchIndex + 1,
-          attempt,
-          call: callNumber,
-          transport: response.transport,
-          model: MODEL,
-        });
-      }
-      batchAccepted += taken.length;
-
-      const responseHash = createHash('sha256').update(response.rawBody).digest('hex');
       calls.push({
         call: callNumber,
         batch: batchIndex + 1,
         attempt,
-        requested,
+        requested: needed,
         seed,
-        startedAt: callStartedAt,
-        completedAt: new Date().toISOString(),
-        transport: response.transport,
-        endpoint: response.endpoint.split('?')[0],
-        model: MODEL,
+        startedAt: response.startedAt,
+        completedAt: response.completedAt,
+        provider: response.provider,
+        endpoint: response.endpoint,
+        requestedModel: response.requestedModel,
+        reportedModel: response.reportedModel,
+        responseId: response.responseId,
+        usage: response.usage,
+        finishReason: response.finishReason,
         httpStatus: response.httpStatus,
         responseHeaders: response.headers,
         failuresBeforeSuccess: response.failuresBeforeSuccess,
         responseSha256: responseHash,
-        parsedCandidates: parsed.length,
+        parsedCandidates: candidates.length,
         accepted: taken.length,
         rejected: validated.rejected.length,
         rejectionReasons: summarizeRejections(validated.rejected),
       });
       rawResponses.push({
         call: callNumber,
-        batch: batchIndex + 1,
-        attempt,
-        transport: response.transport,
-        endpoint: response.endpoint.split('?')[0],
-        model: MODEL,
+        provider: response.provider,
+        endpoint: response.endpoint,
+        requestedModel: response.requestedModel,
+        reportedModel: response.reportedModel,
+        responseId: response.responseId,
         responseSha256: responseHash,
         rawBody: response.rawBody,
       });
 
       console.log(
-        `Batch ${batchIndex + 1}, attempt ${attempt}: accepted ${taken.length}/${requested}; total ${acceptedRecords.length}/${TARGET}; transport ${response.transport}`,
+        `Batch ${batchIndex + 1}, attempt ${attempt}: accepted ${taken.length}/${needed}; total pending ${records.length + batchSentences.length}/${TARGET}; provider ${response.provider}`,
       );
 
-      if (batchAccepted < batchTarget) await sleep(10_000 * attempt);
+      if (batchSentences.length < batchTarget) await sleep(10_000 * attempt);
     }
 
-    if (batchAccepted !== batchTarget) {
-      throw new Error(`Batch ${batchIndex + 1} ended with ${batchAccepted}/${batchTarget} accepted sentences.`);
+    if (batchSentences.length !== batchTarget) {
+      throw new Error(`Batch ${batchIndex + 1} produced ${batchSentences.length}/${batchTarget} valid sentences.`);
+    }
+
+    for (const sentence of batchSentences) {
+      const key = sentence.toLocaleLowerCase('en-US');
+      globalSeen.add(key);
+      const source = calls.findLast((call) => call.batch === batchIndex + 1 && call.provider);
+      records.push({
+        id: records.length + 1,
+        sentence,
+        batch: batchIndex + 1,
+        provider: source?.provider || 'remote-inference-provider',
+        model: source?.reportedModel || source?.requestedModel || null,
+      });
     }
   }
 
-  if (acceptedRecords.length !== TARGET || seen.size !== TARGET) {
-    throw new Error(`Final validation failed: count=${acceptedRecords.length}, unique=${seen.size}`);
+  if (records.length !== TARGET || globalSeen.size !== TARGET) {
+    throw new Error(`Final validation failed: count=${records.length}, unique=${globalSeen.size}, target=${TARGET}.`);
   }
 
-  const numberedText = acceptedRecords
+  const numberedText = records
     .map((record) => `${String(record.id).padStart(3, '0')}. ${record.sentence}`)
     .join('\n') + '\n';
-  const jsonArray = acceptedRecords.map((record) => record.sentence);
-  const jsonl = acceptedRecords.map((record) => JSON.stringify(record)).join('\n') + '\n';
-  const rawJsonl = rawResponses.map((record) => JSON.stringify(record)).join('\n') + '\n';
-  const sentenceHash = createHash('sha256').update(numberedText).digest('hex');
-  const completedAt = new Date().toISOString();
+  const jsonArray = records.map((record) => record.sentence);
+  const jsonl = records.map((record) => JSON.stringify(record)).join('\n') + '\n';
+  const rawJsonl = rawResponses.map((response) => JSON.stringify(response)).join('\n') + '\n';
+  const observedWordCounts = records.map((record) => wordCount(record.sentence));
+  const sentenceHash = sha256(numberedText);
 
   const manifest = {
     runId: RUN_ID,
     startedAt,
-    completedAt,
+    completedAt: new Date().toISOString(),
     generatorHost: {
       environment: 'GitHub Actions hosted Linux VM',
       repository: process.env.GITHUB_REPOSITORY || null,
@@ -425,38 +401,39 @@ async function main() {
     inference: {
       localModelUsed: false,
       remoteApiUsed: true,
-      requestedModelAlias: MODEL,
-      selectedTransport: calls.find((call) => call.transport)?.transport || null,
-      selectedEndpoint: calls.find((call) => call.endpoint)?.endpoint || null,
-      successfulHttpInferenceCalls: calls.filter((call) => call.httpStatus >= 200 && call.httpStatus < 300).length,
+      successfulInferenceCalls: calls.filter((call) => call.httpStatus >= 200 && call.httpStatus < 300).length,
+      providersUsed: [...new Set(calls.map((call) => call.provider).filter(Boolean))],
+      modelsUsed: [...new Set(calls.map((call) => call.reportedModel || call.requestedModel).filter(Boolean))],
       callLog: calls,
     },
     validation: {
       targetCount: TARGET,
-      actualCount: acceptedRecords.length,
-      uniqueCount: seen.size,
-      requiredWordCountRange: [MIN_WORDS, MAX_WORDS],
-      allTerminallyPunctuated: acceptedRecords.every((record) => /[.!?]$/.test(record.sentence)),
-      minObservedWords: Math.min(...acceptedRecords.map((record) => wordCount(record.sentence))),
-      maxObservedWords: Math.max(...acceptedRecords.map((record) => wordCount(record.sentence))),
+      actualCount: records.length,
+      uniqueCount: globalSeen.size,
+      requiredWordRange: [MIN_WORDS, MAX_WORDS],
+      minimumObservedWords: Math.min(...observedWordCounts),
+      maximumObservedWords: Math.max(...observedWordCounts),
+      allTerminallyPunctuated: records.every((record) => /[.!?]$/.test(record.sentence)),
     },
     provenance: {
       sentencesSha256: sentenceHash,
-      rawResponsesRecorded: rawResponses.length,
-      note: 'Every accepted sentence was parsed from a successful remote inference API response; no local language model or static sentence bank was used.',
+      rawInferenceResponsesRecorded: rawResponses.length,
+      note: 'Every accepted sentence was parsed from a successful remote model inference HTTP response. No local model or static sentence bank was used.',
     },
   };
 
   const validationText = [
     `target_count=${TARGET}`,
-    `actual_count=${acceptedRecords.length}`,
-    `unique_count=${seen.size}`,
-    `min_words=${manifest.validation.minObservedWords}`,
-    `max_words=${manifest.validation.maxObservedWords}`,
+    `actual_count=${records.length}`,
+    `unique_count=${globalSeen.size}`,
+    `minimum_observed_words=${manifest.validation.minimumObservedWords}`,
+    `maximum_observed_words=${manifest.validation.maximumObservedWords}`,
     `all_terminally_punctuated=${manifest.validation.allTerminallyPunctuated}`,
     `remote_api_used=${manifest.inference.remoteApiUsed}`,
     `local_model_used=${manifest.inference.localModelUsed}`,
-    `successful_http_inference_calls=${manifest.inference.successfulHttpInferenceCalls}`,
+    `successful_inference_calls=${manifest.inference.successfulInferenceCalls}`,
+    `providers_used=${manifest.inference.providersUsed.join(',')}`,
+    `models_used=${manifest.inference.modelsUsed.join(',')}`,
     `sentences_sha256=${sentenceHash}`,
   ].join('\n') + '\n';
 
@@ -473,10 +450,6 @@ async function main() {
 main().catch(async (error) => {
   console.error(error?.stack || error);
   await mkdir('generated', { recursive: true });
-  await writeFile(
-    'generated/FAILED.txt',
-    `${new Date().toISOString()}\n${String(error?.stack || error)}\n`,
-    'utf8',
-  );
+  await writeFile('generated/FAILED.txt', `${new Date().toISOString()}\n${String(error?.stack || error)}\n`, 'utf8');
   process.exitCode = 1;
 });
