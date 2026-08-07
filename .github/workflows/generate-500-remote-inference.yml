@@ -6,6 +6,11 @@ on:
     paths:
       - ".github/workflows/generate-500-remote-inference.yml"
       - "inference-runner/**"
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/generate-500-remote-inference.yml"
+      - "inference-runner/**"
   workflow_dispatch:
 
 permissions:
@@ -35,6 +40,7 @@ jobs:
             echo "repository=$GITHUB_REPOSITORY"
             echo "workflow=$GITHUB_WORKFLOW"
             echo "run_id=$GITHUB_RUN_ID"
+            echo "event=$GITHUB_EVENT_NAME"
             echo "commit=$GITHUB_SHA"
           } > generated/runner-environment.txt
 
@@ -51,7 +57,7 @@ jobs:
           retention-days: 30
 
       - name: Commit validated output
-        if: success()
+        if: success() && github.event_name == 'push'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
