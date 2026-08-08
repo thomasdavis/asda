@@ -1,0 +1,84 @@
+name: Generate EAC synthetic training set (PR)
+
+on:
+  pull_request:
+    branches: [main]
+    paths: [".github/workflows/generate-eac-training-pr.yml"]
+
+permissions:
+  contents: read
+
+env:
+  EAC_TARGET: "500"
+  EAC_BATCH_SIZE: "20"
+  EAC_REQUEST_INTERVAL_MS: "4500"
+  EAC_OUTPUT_DIR: "generated/eac-v0.1"
+
+jobs:
+  generate:
+    name: Remote-model EAC generation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore generator and validator
+        run: |
+          mkdir -p eac-training
+          python - <<'PY'
+          import base64, gzip, pathlib, re
+          source = pathlib.Path('.github/workflows/generate-eac-training.yml').read_text()
+          for variable, path in [
+              ('GENERATOR_GZIP_BASE64', 'eac-training/generate.mjs'),
+              ('VALIDATOR_GZIP_BASE64', 'eac-training/validate.mjs'),
+          ]:
+              match = re.search(rf'^\s+{variable}: "([^"]+)"$', source, re.MULTILINE)
+              if not match:
+                  raise SystemExit(f'missing embedded source: {variable}')
+              pathlib.Path(path).write_bytes(gzip.decompress(base64.b64decode(match.group(1))))
+          PY
+          node --check eac-training/generate.mjs
+          node --check eac-training/validate.mjs
+          node --check eac-training/run-patched.mjs
+
+      - name: Record VM environment
+        run: |
+          mkdir -p generated/eac-v0.1/provenance
+          {
+            echo "runner_os=$RUNNER_OS"
+            echo "runner_arch=$RUNNER_ARCH"
+            echo "runner_name=$RUNNER_NAME"
+            echo "repository=$GITHUB_REPOSITORY"
+            echo "workflow=$GITHUB_WORKFLOW"
+            echo "run_id=$GITHUB_RUN_ID"
+            echo "run_attempt=$GITHUB_RUN_ATTEMPT"
+            echo "event=$GITHUB_EVENT_NAME"
+            echo "commit=$GITHUB_SHA"
+            echo "ref=$GITHUB_REF"
+            echo "node=$(node --version)"
+            echo "kernel=$(uname -a)"
+          } > generated/eac-v0.1/provenance/runner-environment.txt
+
+      - name: Generate 500 EAC examples through remote inference
+        run: node eac-training/run-patched.mjs
+
+      - name: Independently validate dataset
+        run: node eac-training/validate.mjs generated/eac-v0.1 | tee generated/eac-v0.1/validation-result.json
+
+      - name: Package dataset
+        run: |
+          cd generated
+          tar -czf eac-synthetic-starter-500.tar.gz eac-v0.1
+          sha256sum eac-synthetic-starter-500.tar.gz > eac-synthetic-starter-500.tar.gz.sha256
+
+      - name: Upload dataset and inference evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eac-synthetic-starter-500-${{ github.run_id }}
+          path: |
+            generated/eac-v0.1/
+            generated/eac-synthetic-starter-500.tar.gz
+            generated/eac-synthetic-starter-500.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 30
