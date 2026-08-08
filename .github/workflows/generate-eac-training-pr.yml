@@ -39,6 +39,7 @@ jobs:
           PY
           node --check eac-training/generate.mjs
           node --check eac-training/validate.mjs
+          node --check eac-training/run-patched.mjs
 
       - name: Record VM environment
         run: |
@@ -59,7 +60,7 @@ jobs:
           } > generated/eac-v0.1/provenance/runner-environment.txt
 
       - name: Generate 500 EAC examples through remote inference
-        run: node eac-training/generate.mjs
+        run: node eac-training/run-patched.mjs
 
       - name: Independently validate dataset
         run: node eac-training/validate.mjs generated/eac-v0.1 | tee generated/eac-v0.1/validation-result.json
